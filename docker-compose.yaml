@@ -1,0 +1,242 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: stock-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stockmarket}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stockmarket}
+      POSTGRES_DB: ${POSTGRES_DB:-stock_market}
+    ports:
+      - "5433:5432"
+    volumes:
+      - stock-postgres-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stockmarket} -d ${POSTGRES_DB:-stock_market}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://kafka:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - ./data/kafka:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_TOPIC_REALTIME: ${KAFKA_TOPIC_REALTIME:-stock-market-realtime}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-stock-market-dead-letter}
+      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-3}
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        create_topic() {
+          kafka-topics --bootstrap-server kafka:9092 \
+            --create --if-not-exists \
+            --topic "$$1" \
+            --partitions "$$KAFKA_TOPIC_PARTITIONS" \
+            --replication-factor 1
+
+          current=$$(kafka-topics --bootstrap-server kafka:9092 \
+            --describe --topic "$$1" |
+            awk -F'PartitionCount: ' 'NR == 1 {split($$2, value, " "); print value[1]}')
+
+          if [ "$$current" -lt "$$KAFKA_TOPIC_PARTITIONS" ]; then
+            kafka-topics --bootstrap-server kafka:9092 \
+              --alter --topic "$$1" \
+              --partitions "$$KAFKA_TOPIC_PARTITIONS"
+          fi
+        }
+
+        create_topic "$$KAFKA_TOPIC_REALTIME"
+        create_topic "$$KAFKA_TOPIC_DLQ"
+    restart: "no"
+
+  minio:
+    image: pgsty/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9002:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ./data/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  minio-mc:
+    image: pgsty/mc:latest
+    container_name: minio-mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set local http://minio:9000
+        ${MINIO_ACCESS_KEY:-minioadmin}
+        ${MINIO_SECRET_KEY:-minioadmin};
+      /usr/bin/mc mb local/${MINIO_BUCKET:-stock-market-data} --ignore-existing;
+      exit 0;
+      "
+    restart: on-failure
+
+  stream-producer:
+    build:
+      context: ./src/kafka
+    image: stock-market-stream-producer:local
+    container_name: stream-producer
+    command: python /app/producer/stream_producer.py
+    environment:
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY}
+      STREAM_SYMBOLS: ${STREAM_SYMBOLS:-AAPL,MSFT,GOOGL,AMZN,META,TSLA,NVDA,INTC,JPM,V}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_REALTIME: ${KAFKA_TOPIC_REALTIME:-stock-market-realtime}
+    volumes:
+      - ./src/kafka/producer:/app/producer:ro
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  stream-consumer:
+    build:
+      context: ./src/kafka
+    image: stock-market-stream-consumer:local
+    container_name: stream-consumer
+    command: python /app/consumer/stream_data_consumer.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_REALTIME: ${KAFKA_TOPIC_REALTIME:-stock-market-realtime}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-stock-market-dead-letter}
+      KAFKA_GROUP_REALTIME_ID: ${KAFKA_GROUP_REALTIME_ID:-stock-market-consumer-group-realtime}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-stock-market-data}
+      STREAM_BATCH_SIZE: ${STREAM_BATCH_SIZE:-100}
+      STREAM_FLUSH_INTERVAL_SECONDS: ${STREAM_FLUSH_INTERVAL_SECONDS:-60}
+    volumes:
+      - ./src/kafka/consumer:/app/consumer:ro
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  analytics-consumer:
+    build:
+      context: ./src/kafka
+    image: stock-market-analytics-consumer:local
+    container_name: analytics-consumer
+    command: python /app/consumer/analytics_consumer.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_REALTIME: ${KAFKA_TOPIC_REALTIME:-stock-market-realtime}
+      KAFKA_GROUP_ANALYTICS_ID: ${KAFKA_GROUP_ANALYTICS_ID:-stock-market-analytics-group}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-stockmarket}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stockmarket}
+      POSTGRES_DB: ${POSTGRES_DB:-stock_market}
+      ANALYTICS_BATCH_SIZE: ${ANALYTICS_BATCH_SIZE:-100}
+      ANALYTICS_FLUSH_INTERVAL_SECONDS: ${ANALYTICS_FLUSH_INTERVAL_SECONDS:-5}
+    volumes:
+      - ./src/kafka/consumer:/app/consumer:ro
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./src/dashboard
+    image: stock-market-dashboard:local
+    container_name: stock-dashboard
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-stockmarket}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stockmarket}
+      POSTGRES_DB: ${POSTGRES_DB:-stock_market}
+    ports:
+      - "8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      analytics-consumer:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  pipeline-tests:
+    profiles: ["test"]
+    build:
+      context: ./src/kafka
+    image: stock-market-pipeline-tests:local
+    working_dir: /workspace
+    command: python -m unittest discover -s tests -v
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-stockmarket}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stockmarket}
+      POSTGRES_DB: ${POSTGRES_DB:-stock_market}
+    volumes:
+      - ./src:/workspace/src:ro
+      - ./tests:/workspace/tests:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  stock-postgres-volume:

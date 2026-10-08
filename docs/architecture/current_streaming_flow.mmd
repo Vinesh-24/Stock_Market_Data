@@ -1,0 +1,30 @@
+flowchart LR
+    FINN["Finnhub WebSocket<br/>Live stock trades"]
+
+    subgraph Docker["Docker Compose"]
+        PRODUCER["Python stream producer<br/>Normalize trades"]
+        KAFKA[("Kafka<br/>stock-market-realtime<br/>3 partitions")]
+        CONSUMER["Python stream consumer<br/>Validate and micro-batch"]
+        DLQ[("Kafka dead-letter topic<br/>Invalid records")]
+        MINIO[("MinIO raw/realtime<br/>CSV by symbol and date")]
+        ANALYTICS["Analytics consumer<br/>Deduplicate by event_id"]
+        POSTGRES[("PostgreSQL<br/>Trades + 1-minute metrics")]
+        DASHBOARD["Streamlit dashboard<br/>Raw Trades + Live Metrics"]
+    end
+
+    FINN --> PRODUCER
+    PRODUCER -->|"JSON keyed by symbol"| KAFKA
+    KAFKA -->|"manual offset commit"| CONSUMER
+    CONSUMER -->|"valid trades"| MINIO
+    CONSUMER -->|"invalid records"| DLQ
+    KAFKA -->|"independent consumer group"| ANALYTICS
+    ANALYTICS -->|"transactional inserts"| POSTGRES
+    POSTGRES -->|"refresh every 5 seconds"| DASHBOARD
+
+    classDef source fill:#f4ecf7,stroke:#7d3c98,color:#4a235a
+    classDef process fill:#e8f8f5,stroke:#148f77,color:#0b5345
+    classDef storage fill:#eaf2f8,stroke:#2874a6,color:#154360
+
+    class FINN source
+    class PRODUCER,CONSUMER,ANALYTICS,DASHBOARD process
+    class KAFKA,DLQ,MINIO,POSTGRES storage

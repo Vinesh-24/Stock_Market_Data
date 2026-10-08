@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local service data and generated runtime files
+data/
+
+# Temporary diagram-rendering dependencies
+docs/architecture/.npm-cache/
