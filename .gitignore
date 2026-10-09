@@ -9,3 +9,12 @@ data/
 
 # Temporary diagram-rendering dependencies
 docs/architecture/.npm-cache/
+
+# Retired batch-processing components
+src/airflow/
+src/spark/
+src/kafka/producer/batch_producer.py
+src/kafka/consumer/batch_data_consumer.py
+/commands.sh
+/requirements.txt
+/docs/architecture/as_is.png
